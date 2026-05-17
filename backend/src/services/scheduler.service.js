@@ -1,0 +1,355 @@
+import { nanoid } from 'nanoid';
+import { DEFAULT_SELECTED_DAYS } from '../config/constants.js';
+
+export function generateTimetable(input) {
+  const { vacationClass, subjects, programmes, teachers } = input;
+  const placed = [];
+
+  const selectedProgrammes = programmes.filter((programme) => vacationClass.programmeIds.includes(programme.id));
+  const selectedTeachers = teachers.filter((teacher) => vacationClass.teacherIds.includes(teacher.id));
+  const selectedDays = vacationClass.selectedDays?.length ? vacationClass.selectedDays : [...DEFAULT_SELECTED_DAYS];
+  const usedDays = selectedDays.filter((day) => vacationClass.teacherAvailabilities.some((availability) => availability.day === day));
+  const dailyStartHour = vacationClass.dailyStartHour ?? 7;
+  const dailyEndHour = vacationClass.dailyEndHour ?? 18;
+  const subjectById = new Map(subjects.map((subject) => [subject.id, subject]));
+  const requirementMap = new Map();
+  const diagnosticMap = new Map();
+
+  for (const programme of selectedProgrammes) {
+    const programmeSubjectIds = [...(programme.coreSubjectIds ?? []), ...(programme.electiveSubjectIds ?? [])];
+    for (const subjectId of programmeSubjectIds) {
+      const subject = subjectById.get(subjectId);
+      if (!subject) continue;
+
+      const existing = requirementMap.get(subjectId);
+      if (existing) {
+        if (!existing.programmeIds.includes(programme.id)) existing.programmeIds.push(programme.id);
+      } else {
+        requirementMap.set(subjectId, {
+          subjectId,
+          programmeIds: [programme.id],
+          requiredHours: subject.creditHours,
+          remainingHours: subject.creditHours,
+        });
+      }
+    }
+  }
+
+  const requirements = Array.from(requirementMap.values());
+
+  const getDiagnostics = (subjectId) => {
+    const existing = diagnosticMap.get(subjectId);
+    if (existing) return existing;
+    const emptyDiagnostics = {
+      noTeacher: 0,
+      noAvailability: 0,
+      teacherBusy: 0,
+      coreBlocked: 0,
+      programmeBlocked: 0,
+      breakBlocked: 0,
+      noCandidate: 0,
+    };
+    diagnosticMap.set(subjectId, emptyDiagnostics);
+    return emptyDiagnostics;
+  };
+
+  const isTeacherAvailable = (teacherId, day, hour) => {
+    const availability = vacationClass.teacherAvailabilities.find((item) => item.teacherId === teacherId && item.day === day);
+    if (!availability) return false;
+    return hour >= availability.startHour && hour < availability.endHour;
+  };
+
+  const isBreakPeriod = (day, hour) => {
+    return (vacationClass.breakPeriods ?? []).some((breakPeriod) =>
+      breakPeriod.day === day && hour >= breakPeriod.startHour && hour < breakPeriod.endHour
+    );
+  };
+
+  const isTeacherBusy = (teacherId, day, hour) => placed.some((slot) => slot.teacherId === teacherId && slot.day === day && slot.hour === hour);
+  const getTeacherPreference = (teacherId) => vacationClass.teacherSubjectPreferences.find((preference) => preference.teacherId === teacherId);
+  const getSubjectType = (subjectId) => subjectById.get(subjectId)?.type || 'elective';
+  const hasAnyCoreAtCell = (day, hour) => placed.some((slot) => slot.day === day && slot.hour === hour && getSubjectType(slot.subjectId) === 'core');
+  const hasAnySlotAtCell = (day, hour) => placed.some((slot) => slot.day === day && slot.hour === hour);
+  const hasProgrammeAtCell = (day, hour, programmeId) => placed.some((slot) => slot.day === day && slot.hour === hour && slot.programmeIds.includes(programmeId));
+  const hasSameSubjectOnDay = (subjectId, day) => placed.filter((slot) => slot.subjectId === subjectId && slot.day === day).length;
+  const slotsOnDayForProgramme = (day, programmeId) => placed.filter((slot) => slot.programmeIds.includes(programmeId) && slot.day === day).length;
+  const dayLoad = (day) => placed.filter((slot) => slot.day === day).length;
+  const teacherLoad = (teacherId) => placed.filter((slot) => slot.teacherId === teacherId).length;
+
+  const findBestTeacher = (subjectId, day, hour) => {
+    const preferredCandidates = selectedTeachers.filter((teacher) => {
+      if (!(teacher.subjectIds ?? []).includes(subjectId)) return false;
+      const preference = getTeacherPreference(teacher.id);
+      if (preference && !(preference.subjectIds ?? []).includes(subjectId)) return false;
+      if (!isTeacherAvailable(teacher.id, day, hour)) return false;
+      if (isTeacherBusy(teacher.id, day, hour)) return false;
+      return true;
+    });
+
+    if (preferredCandidates.length > 0) {
+      preferredCandidates.sort((teacherA, teacherB) => teacherLoad(teacherA.id) - teacherLoad(teacherB.id));
+      return preferredCandidates[0];
+    }
+
+    const fallbackCandidates = selectedTeachers.filter((teacher) => {
+      if (!(teacher.subjectIds ?? []).includes(subjectId)) return false;
+      if (!isTeacherAvailable(teacher.id, day, hour)) return false;
+      if (isTeacherBusy(teacher.id, day, hour)) return false;
+      return true;
+    });
+
+    if (fallbackCandidates.length > 0) {
+      fallbackCandidates.sort((teacherA, teacherB) => teacherLoad(teacherA.id) - teacherLoad(teacherB.id));
+      return fallbackCandidates[0];
+    }
+
+    return null;
+  };
+
+  const scoreSlot = (subjectId, day, hour, programmeIds) => {
+    let score = 0;
+    const existingOnDay = hasSameSubjectOnDay(subjectId, day);
+    if (existingOnDay === 0) score += 100;
+    else if (existingOnDay === 1) score += 20;
+    else score -= 50;
+
+    const maxDayLoad = Math.max(...usedDays.map((dayItem) => dayLoad(dayItem)), 1);
+    const currentDayLoad = dayLoad(day);
+    score += (maxDayLoad - currentDayLoad) * 10;
+
+    for (const programmeId of programmeIds) {
+      const programmeDayLoad = slotsOnDayForProgramme(day, programmeId);
+      score -= programmeDayLoad * 5;
+    }
+
+    if (hour >= 8 && hour <= 12) score += 5;
+    else if (hour >= 13 && hour <= 15) score += 2;
+
+    return score;
+  };
+
+  const findCandidates = (subjectId, programmeIds) => {
+    const candidates = [];
+    const subjectType = getSubjectType(subjectId);
+    const diagnostics = getDiagnostics(subjectId);
+    const eligibleTeachers = selectedTeachers.filter((teacher) => {
+      if (!(teacher.subjectIds ?? []).includes(subjectId)) return false;
+      const preference = getTeacherPreference(teacher.id);
+      return !preference || (preference.subjectIds ?? []).includes(subjectId);
+    });
+
+    if (eligibleTeachers.length === 0) {
+      diagnostics.noTeacher++;
+      return candidates;
+    }
+
+    for (const day of usedDays) {
+      for (let hour = dailyStartHour; hour < dailyEndHour; hour++) {
+        if (isBreakPeriod(day, hour)) {
+          diagnostics.breakBlocked++;
+          continue;
+        }
+        if (subjectType === 'core' && hasAnySlotAtCell(day, hour)) {
+          diagnostics.coreBlocked++;
+          continue;
+        }
+        if (subjectType === 'elective' && hasAnyCoreAtCell(day, hour)) {
+          diagnostics.coreBlocked++;
+          continue;
+        }
+        if (programmeIds.some((programmeId) => hasProgrammeAtCell(day, hour, programmeId))) {
+          diagnostics.programmeBlocked++;
+          continue;
+        }
+
+        const availableTeachers = eligibleTeachers.filter((teacher) => isTeacherAvailable(teacher.id, day, hour));
+        if (availableTeachers.length === 0) {
+          diagnostics.noAvailability++;
+          continue;
+        }
+        if (availableTeachers.every((teacher) => isTeacherBusy(teacher.id, day, hour))) {
+          diagnostics.teacherBusy++;
+          continue;
+        }
+
+        const teacher = findBestTeacher(subjectId, day, hour);
+        if (!teacher) continue;
+        candidates.push({ day, hour, teacher, score: scoreSlot(subjectId, day, hour, programmeIds) });
+      }
+    }
+
+    candidates.sort((slotA, slotB) => slotB.score - slotA.score);
+    if (candidates.length === 0) diagnostics.noCandidate++;
+    return candidates;
+  };
+
+  let madeProgress = true;
+  while (madeProgress && requirements.some((requirement) => requirement.remainingHours > 0)) {
+    madeProgress = false;
+    const pendingRequirements = requirements
+      .filter((requirement) => requirement.remainingHours > 0)
+      .sort((requirementA, requirementB) => {
+        const teachersForA = selectedTeachers.filter((teacher) => (teacher.subjectIds ?? []).includes(requirementA.subjectId)).length;
+        const teachersForB = selectedTeachers.filter((teacher) => (teacher.subjectIds ?? []).includes(requirementB.subjectId)).length;
+        if (teachersForA !== teachersForB) return teachersForA - teachersForB;
+        if (requirementA.programmeIds.length !== requirementB.programmeIds.length) return requirementB.programmeIds.length - requirementA.programmeIds.length;
+        return requirementB.remainingHours - requirementA.remainingHours;
+      });
+
+    for (const requirement of pendingRequirements) {
+      const candidates = findCandidates(requirement.subjectId, requirement.programmeIds);
+      if (candidates.length === 0) continue;
+      const best = candidates[0];
+      placed.push({ day: best.day, hour: best.hour, subjectId: requirement.subjectId, teacherId: best.teacher.id, programmeIds: requirement.programmeIds });
+      requirement.remainingHours--;
+      madeProgress = true;
+    }
+  }
+
+  const slots = placed.map((slot) => ({
+    id: nanoid(),
+    day: slot.day,
+    startHour: slot.hour,
+    endHour: slot.hour + 1,
+    subjectId: slot.subjectId,
+    teacherId: slot.teacherId,
+    programmeIds: slot.programmeIds,
+    status: 'scheduled',
+  }));
+  const report = buildReport(placed, subjects, selectedProgrammes, diagnosticMap);
+  return { slots, report };
+}
+
+function buildReport(placed, subjects, programmes, diagnosticMap) {
+  const warnings = [];
+  const subjectReports = [];
+  const requiredSubjectIds = new Set();
+
+  for (const programme of programmes) {
+    for (const subjectId of programme.coreSubjectIds ?? []) requiredSubjectIds.add(subjectId);
+    for (const subjectId of programme.electiveSubjectIds ?? []) requiredSubjectIds.add(subjectId);
+  }
+
+  let totalCreditHoursRequired = 0;
+  let totalCreditHoursPlaced = 0;
+  let totalSubjectsFullyFulfilled = 0;
+  let totalSubjectsPartiallyFulfilled = 0;
+  let totalSubjectsMissing = 0;
+
+  for (const subjectId of requiredSubjectIds) {
+    const subject = subjects.find((item) => item.id === subjectId);
+    if (!subject) continue;
+
+    const requiredHours = subject.creditHours;
+    const placedSlots = placed.filter((slot) => slot.subjectId === subjectId);
+    const placedHours = placedSlots.length;
+    const fulfilled = placedHours === requiredHours;
+    const shortfall = Math.max(0, requiredHours - placedHours);
+    const overplaced = Math.max(0, placedHours - requiredHours);
+    const programmeIds = programmes
+      .filter((programme) => (programme.coreSubjectIds ?? []).includes(subjectId) || (programme.electiveSubjectIds ?? []).includes(subjectId))
+      .map((programme) => programme.id);
+
+    totalCreditHoursRequired += requiredHours;
+    totalCreditHoursPlaced += Math.min(placedHours, requiredHours);
+
+    if (fulfilled) totalSubjectsFullyFulfilled++;
+    else if (overplaced > 0) {
+      totalSubjectsPartiallyFulfilled++;
+      warnings.push(`${subject.name} (${subject.type}): needs ${requiredHours}h, got ${placedHours}h — ${overplaced}h over-placed`);
+    } else if (placedHours > 0) {
+      totalSubjectsPartiallyFulfilled++;
+      warnings.push(`${subject.name} (${subject.type}): needs ${requiredHours}h, got ${placedHours}h — ${shortfall}h short`);
+    } else {
+      totalSubjectsMissing++;
+      warnings.push(`${subject.name} (${subject.type}): needs ${requiredHours}h, got 0h — completely unplaced`);
+    }
+
+    subjectReports.push({
+      subjectId,
+      subjectName: subject.name,
+      subjectType: subject.type,
+      requiredHours,
+      placedHours,
+      fulfilled,
+      shortfall,
+      programmeIds,
+      diagnostics: buildSubjectDiagnostics(diagnosticMap.get(subjectId)),
+      recommendations: buildSubjectRecommendations(diagnosticMap.get(subjectId), subject.type),
+    });
+  }
+
+  subjectReports.sort((reportA, reportB) => {
+    const hasIssueA = reportA.shortfall > 0 || reportA.placedHours > reportA.requiredHours;
+    const hasIssueB = reportB.shortfall > 0 || reportB.placedHours > reportB.requiredHours;
+    if (hasIssueA && !hasIssueB) return -1;
+    if (!hasIssueA && hasIssueB) return 1;
+    return reportB.shortfall - reportA.shortfall;
+  });
+
+  const programmeReports = programmes.map((programme) => {
+    const allSubjectIds = [...(programme.coreSubjectIds ?? []), ...(programme.electiveSubjectIds ?? [])];
+    const programmeSubjectReports = subjectReports.filter((reportItem) => reportItem.programmeIds.includes(programme.id));
+    const representedSubjects = programmeSubjectReports.filter((reportItem) => reportItem.placedHours > 0).length;
+    const fullyFulfilled = programmeSubjectReports.filter((reportItem) => reportItem.fulfilled).length;
+    const partiallyFulfilled = programmeSubjectReports.filter((reportItem) => !reportItem.fulfilled && reportItem.placedHours > 0).length;
+    const missingSubjects = allSubjectIds.length - representedSubjects;
+
+    if (missingSubjects > 0) warnings.push(`Programme "${programme.name}": ${missingSubjects} of ${allSubjectIds.length} subjects have no slots at all`);
+
+    return {
+      programmeId: programme.id,
+      programmeName: programme.name,
+      totalSubjects: allSubjectIds.length,
+      representedSubjects,
+      fullyFulfilled,
+      partiallyFulfilled,
+      missingSubjects,
+    };
+  });
+
+  const totalSubjectsRequired = requiredSubjectIds.size;
+  const totalSubjectsPlaced = totalSubjectsFullyFulfilled + totalSubjectsPartiallyFulfilled;
+  const fulfillmentPercentage = totalCreditHoursRequired > 0 ? Math.round((totalCreditHoursPlaced / totalCreditHoursRequired) * 100) : 0;
+
+  return {
+    totalSubjectsRequired,
+    totalSubjectsPlaced,
+    totalSubjectsFullyFulfilled,
+    totalSubjectsPartiallyFulfilled,
+    totalSubjectsMissing,
+    totalCreditHoursRequired,
+    totalCreditHoursPlaced,
+    fulfillmentPercentage,
+    subjects: subjectReports,
+    programmes: programmeReports,
+    warnings,
+  };
+}
+
+function buildSubjectDiagnostics(diagnostics) {
+  if (!diagnostics) return [];
+  const messages = [];
+  if (diagnostics.noTeacher > 0) messages.push('No selected teacher is eligible or willing to teach this subject.');
+  if (diagnostics.noAvailability > 0) messages.push('Eligible teachers were not available in many open periods.');
+  if (diagnostics.teacherBusy > 0) messages.push('Eligible teachers were already assigned to another session in available periods.');
+  if (diagnostics.coreBlocked > 0) messages.push('Available periods were blocked by core-subject timetable rules.');
+  if (diagnostics.programmeBlocked > 0) messages.push('Available periods clashed with another subject for the same programme.');
+  if (diagnostics.breakBlocked > 0) messages.push('Some otherwise possible periods were reserved as vacation class breaks.');
+  if (diagnostics.noCandidate > 0 && messages.length === 0) messages.push('No legal timetable position remained after applying all constraints.');
+  return messages;
+}
+
+function buildSubjectRecommendations(diagnostics, subjectType) {
+  if (!diagnostics) return [];
+  const recommendations = [];
+  if (diagnostics.noTeacher > 0) recommendations.push('Assign at least one selected teacher to this subject or enable it in teacher preferences.');
+  if (diagnostics.noAvailability > 0) recommendations.push('Extend teacher availability or the vacation class daily teaching window.');
+  if (diagnostics.teacherBusy > 0) recommendations.push('Add another teacher for this subject or reduce conflicting teacher assignments.');
+  if (diagnostics.coreBlocked > 0 && subjectType === 'core') recommendations.push('Increase the daily window because core subjects cannot run beside any other class.');
+  if (diagnostics.coreBlocked > 0 && subjectType === 'elective') recommendations.push('Move capacity away from core-heavy periods by extending hours or adding available days.');
+  if (diagnostics.programmeBlocked > 0) recommendations.push('Add more timetable capacity because electives in the same programme cannot run together.');
+  if (diagnostics.breakBlocked > 0) recommendations.push('Review break periods or increase teaching hours if breaks reduce too much capacity.');
+  if (diagnostics.noCandidate > 0 && recommendations.length === 0) recommendations.push('Increase available periods, selected teachers, or programme capacity and regenerate.');
+  return recommendations;
+}
